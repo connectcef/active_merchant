@@ -1,7 +1,7 @@
 module ActiveMerchant
   module Billing
     module VancoCommon
-      ERROR_CODES = {
+      VANCO_ERROR_CODE = {
         '10' =>	"Invalid UserID/password combination",
         '11' =>	"Session expired",
         '25' =>	"All default address fields are required",

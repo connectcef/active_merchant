@@ -1,4 +1,7 @@
 require 'nokogiri'
+require 'base64'
+require 'openssl'
+require 'zlib'
 
 module ActiveMerchant
   module Billing
@@ -46,47 +49,67 @@ module ActiveMerchant
 
       private
 
-      def parse(xml)
-        response = {}
-
-        doc = Nokogiri::XML(xml)
-        doc.root.xpath('*').each do |node|
-          if node.elements.empty?
-            response[node.name.downcase.to_sym] = node.text
-          else
-            node.elements.each do |childnode|
-              childnode_to_response(response, node, childnode)
-            end
-          end
+      def parse(body)
+        results = body.split(/\r?\n/).inject({}) do |acc, pair|
+          key, value = pair.split('=')
+          acc[key] = CGI.unescape(value)
+          acc
         end
 
-        response
-      end
-
-      def childnode_to_response(response, node, childnode)
-        name = "#{node.name.downcase}_#{childnode.name.downcase}"
-        if name == 'response_errors' && !childnode.elements.empty?
-          add_errors_to_response(response, childnode.to_s)
-        else
-          response[name.downcase.to_sym] = childnode.text
+        if !results.include?('errorlist') && results.include?('nvpvar')
+          nvpvar = Base64.urlsafe_decode64(results['nvpvar'])
+          cipher = OpenSSL::Cipher.new('aes-256-ecb')
+byebug
+          cipher.decrypt
+          cipher.key = @options[:merchant_key]
+          plain = cipher.update(nvpvar) + cipher.final
+          results['nvpvar'] = Zlib::Inflate.inflate(plain)
         end
+
+        results
       end
 
-      def add_errors_to_response(response, errors_xml)
-        errors_hash = Hash.from_xml(errors_xml).values.first
-        response[:response_errors] = errors_hash
+      # def parse(xml)
+      #   response = {}
 
-        error = errors_hash['Error']
-        if error.kind_of?(Hash)
-          response[:error_message] = error['ErrorDescription']
-          response[:error_codes] = error['ErrorCode']
-        elsif error.kind_of?(Array)
-          error_str = error.map { |e| e['ErrorDescription'] }.join('. ')
-          error_codes = error.map { |e| e['ErrorCode'] }.join(', ')
-          response[:error_message] = "#{error_str}."
-          response[:error_codes] = error_codes
-        end
-      end
+      #   doc = Nokogiri::XML(xml)
+      #   doc.root.xpath('*').each do |node|
+      #     if node.elements.empty?
+      #       response[node.name.downcase.to_sym] = node.text
+      #     else
+      #       node.elements.each do |childnode|
+      #         childnode_to_response(response, node, childnode)
+      #       end
+      #     end
+      #   end
+
+      #   response
+      # end
+
+      # def childnode_to_response(response, node, childnode)
+      #   name = "#{node.name.downcase}_#{childnode.name.downcase}"
+      #   if name == 'response_errors' && !childnode.elements.empty?
+      #     add_errors_to_response(response, childnode.to_s)
+      #   else
+      #     response[name.downcase.to_sym] = childnode.text
+      #   end
+      # end
+
+      # def add_errors_to_response(response, errors_xml)
+      #   errors_hash = Hash.from_xml(errors_xml).values.first
+      #   response[:response_errors] = errors_hash
+
+      #   error = errors_hash['Error']
+      #   if error.kind_of?(Hash)
+      #     response[:error_message] = error['ErrorDescription']
+      #     response[:error_codes] = error['ErrorCode']
+      #   elsif error.kind_of?(Array)
+      #     error_str = error.map { |e| e['ErrorDescription'] }.join('. ')
+      #     error_codes = error.map { |e| e['ErrorCode'] }.join(', ')
+      #     response[:error_message] = "#{error_str}."
+      #     response[:error_codes] = error_codes
+      #   end
+      # end
 
       def commit(request, success_field_name)
         #response = parse(ssl_post(url, request, headers))
@@ -94,7 +117,6 @@ module ActiveMerchant
         response = parse(ssl_post(url, post_data(request), headers))
         #succeeded = success_from(response, success_field_name)
         succeeded = empty?(response['errorlist'])
-byebug
         Response.new(
           succeeded,
           message_from(succeeded, response),
@@ -157,8 +179,9 @@ byebug
       end
 
       def add_request(doc, request_type)
-        doc['requesttype'] = request_type
-        doc['requestid'] = SecureRandom.hex(15)
+        doc['nvpvar'] ||= {}
+        doc['nvpvar']['requesttype'] = request_type
+        doc['nvpvar']['requestid'] = SecureRandom.hex(15)
       end
 
       def add_auth(doc, request_type, session_id)
@@ -267,10 +290,10 @@ byebug
 
       def login_request
         doc = {}
+        doc['nvpvar'] = {}
         add_request(doc, 'login')
-        doc['nvpvar'] = ''
-        doc['userid'] = @options[:user_id]
-        doc['password'] = @options[:password]
+        doc['nvpvar']['userid'] = @options[:user_id]
+        doc['nvpvar']['password'] = @options[:password]
         doc
       end
 
@@ -282,7 +305,16 @@ byebug
         { 'Content-Type'  => 'application/x-www-form-urlencoded;charset=UTF-8' }
       end
 
-      def post_data(params)
+      def post_data(doc)
+        if doc.include?('nvpvar')
+          nvpvar = doc['nvpvar'].map { |k, v| "#{k.to_s}=#{v.to_s}" }.join('&')
+          if doc['requesttype'] && doc['requesttype'] != 'login'
+            # TODO! encrypt nvpvar
+          end
+          params = doc.merge({ 'nvpvar' => nvpvar })
+        else
+          params = doc
+        end
         params.map { |k, v| "#{CGI.escape(k.to_s)}=#{CGI.escape(v.to_s)}" }.join('&')
       end
     end
