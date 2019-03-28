@@ -1,4 +1,3 @@
-require 'nokogiri'
 require 'base64'
 require 'openssl'
 require 'zlib'
@@ -26,14 +25,14 @@ module ActiveMerchant
       def purchase(money, payment_method, options={})
         MultiResponse.run do |r|
           r.process { login }
-          r.process { commit(purchase_request(money, payment_method, r.params['sessionid'], options)) }
+          r.process { commit('purchase', purchase_request(money, payment_method, r.params['sessionid'], options)) }
         end
       end
 
       def refund(money, authorization, options={})
         MultiResponse.run do |r|
           r.process { login }
-          r.process { commit(refund_request(money, authorization, r.params['sessionid'])) } #, :response_creditrequestreceived
+          r.process { commit('refund', refund_request(money, authorization, r.params['sessionid'])) }
         end
       end
 
@@ -75,25 +74,9 @@ module ActiveMerchant
         results
       end
 
-      # def add_errors_to_response(response, errors_xml)
-      #   errors_hash = Hash.from_xml(errors_xml).values.first
-      #   response[:response_errors] = errors_hash
-
-      #   error = errors_hash['Error']
-      #   if error.kind_of?(Hash)
-      #     response[:error_message] = error['ErrorDescription']
-      #     response[:error_codes] = error['ErrorCode']
-      #   elsif error.kind_of?(Array)
-      #     error_str = error.map { |e| e['ErrorDescription'] }.join('. ')
-      #     error_codes = error.map { |e| e['ErrorCode'] }.join(', ')
-      #     response[:error_message] = "#{error_str}."
-      #     response[:error_codes] = error_codes
-      #   end
-      # end
-
-      def commit(params)
+      def commit(request_type, params)
         response = parse(ssl_post(url, post_data(params), headers))
-        succeeded = empty?(response['errorlist'])
+        succeeded = success_from(request_type, response)
         Response.new(
           succeeded,
           message_from(succeeded, response),
@@ -101,6 +84,11 @@ module ActiveMerchant
           authorization: authorization_from(response),
           test: test?
         )
+      end
+
+      def success_from(request_type, response)
+        return response['creditrequestreceived'] == 'yes' if request_type == 'refund'
+        empty?(response['errorlist'])
       end
 
       def message_from(succeeded, response)
@@ -126,27 +114,21 @@ module ActiveMerchant
         add_auth(doc, 'eftaddcompletetransaction', session_id)
         add_client_id(doc)
         add_amount(doc, money, options)
-##### need to resume here
         add_payment_method(doc, payment_method, options)
         add_options(doc, options)
         add_purchase_noise(doc)
-
         doc
       end
 
       def refund_request(money, authorization, session_id)
-        build_xml_request do |doc|
-          add_auth(doc, 'EFTAddCredit', session_id)
-
-          doc.Request do
-            doc.RequestVars do
-              add_client_id(doc)
-              add_amount(doc, money, options)
-              add_reference(doc, authorization)
-              add_refund_noise(doc)
-            end
-          end
-        end
+        doc = {}
+        doc['nvpvar'] = {}
+        add_auth(doc, 'eftaddcredit', session_id)
+        add_client_id(doc)
+        add_amount(doc, money, options)
+        add_reference(doc, authorization)
+        add_refund_noise(doc)
+        doc
       end
 
       def add_request(doc, request_type)
@@ -162,9 +144,9 @@ module ActiveMerchant
 
       def add_reference(doc, authorization)
         customer_ref, payment_method_ref, transaction_ref = split_authorization(authorization)
-        doc.CustomerRef(customer_ref)
-        doc.PaymentMethodRef(payment_method_ref)
-        doc.TransactionRef(transaction_ref)
+        doc['nvpvar']['customerref'] = customer_ref
+        doc['nvpvar']['paymentmethodref'] = payment_method_ref
+        doc['nvpvar']['transactionref'] = transaction_ref
       end
 
       def add_amount(doc, money, options)
@@ -190,13 +172,13 @@ module ActiveMerchant
       end
 
       def add_credit_card(doc, credit_card, options)
-        doc.AccountNumber(credit_card.number)
-        doc.CustomerName("#{credit_card.last_name}, #{credit_card.first_name}")
-        doc.CardExpMonth(format(credit_card.month, :two_digits))
-        doc.CardExpYear(format(credit_card.year, :two_digits))
-        doc.CardCVV2(credit_card.verification_value)
-        doc.CardBillingName(credit_card.name)
-        doc.AccountType('CC')
+        doc['accountnumber'] = credit_card.number
+        doc['name_on_card'] = credit_card.name
+        doc['expmonth'] = format(credit_card.month, :two_digits)
+        doc['expyear'] = format(credit_card.year, :two_digits)
+        doc['cvvcode'] = credit_card.verification_value
+        doc['name'] = credit_card.name
+        doc['accounttype'] = 'CC'
         add_billing_address(doc, options)
       end
 
@@ -204,43 +186,44 @@ module ActiveMerchant
         address = options[:billing_address]
         return unless address
 
-        doc.CardBillingAddr1(address[:address1])
-        doc.CardBillingAddr2(address[:address2])
-        doc.CardBillingCity(address[:city])
-        doc.CardBillingState(address[:state])
-        doc.CardBillingZip(address[:zip])
-        doc.CardBillingCountryCode(address[:country])
+        doc['billingaddr1'] = address[:address1]
+        doc['billingaddr2'] = address[:address2]
+        doc['billingcity'] = address[:city]
+        doc['billingstate'] = address[:state]
+        doc['billingzip'] = address[:zip]
+        doc['billingcountrycode'] = address[:country]
       end
 
       def add_echeck(doc, echeck)
         if echeck.account_type == 'savings'
-          doc.AccountType('S')
+          doc['accounttype'] = 'S'
         else
-          doc.AccountType('C')
+          doc['accounttype'] = 'C'
         end
 
-        doc.CustomerName("#{echeck.last_name}, #{echeck.first_name}")
-        doc.AccountNumber(echeck.account_number)
-        doc.RoutingNumber(echeck.routing_number)
-        doc.TransactionTypeCode('WEB')
+        doc['name'] = "#{echeck.last_name}, #{echeck.first_name}"
+        #doc['nvpvar']['customername'] = "#{echeck.last_name}, #{echeck.first_name}"
+        doc['accountnumber'] = echeck.account_number
+        doc['routingnumber'] = echeck.routing_number
+        doc['nvpvar']['transactiontypecode'] = 'WEB'
       end
 
       def add_purchase_noise(doc)
-        doc.StartDate('0000-00-00')
-        doc.FrequencyCode('O')
+        doc['nvpvar']['startdate'] = '0000-00-00'
+        doc['nvpvar']['frequencycode'] = 'O'
       end
 
       def add_refund_noise(doc)
-        doc.ContactName('Bilbo Baggins')
-        doc.ContactPhone('1234567890')
-        doc.ContactExtension('None')
-        doc.ReasonForCredit('Refund requested')
+        doc['nvpvar']['contactname'] = 'Bilbo Baggins'
+        doc['nvpvar']['contactphone'] = '1234567890'
+        doc['nvpvar']['contactextension'] = 'none'
+        doc['nvpvar']['reasonforcredit'] = 'Refund requested'
       end
 
       def add_options(doc, options)
-        doc.CustomerIPAddress(options[:ip]) if options[:ip]
-        doc.NewCustomer(options[:new_customer]) if options[:new_customer]
-        doc.CustomerID(options[:customer_id]) if options[:customer_id]
+        #doc['customeripaddress'] = options[:ip] if options[:ip] # not in nvpws spec
+        doc['newcustomer'] = options[:new_customer] if options[:new_customer]
+        doc['nvpvar']['customerid'] = options[:customer_id] if options[:customer_id]
       end
 
       def add_client_id(doc)
@@ -248,7 +231,7 @@ module ActiveMerchant
       end
 
       def login
-        commit(login_request)
+        commit('login', login_request)
       end
 
       def login_request
