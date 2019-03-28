@@ -19,21 +19,21 @@ module ActiveMerchant
       self.display_name = 'Vanco Payment Solutions'
 
       def initialize(options={})
-        requires!(options, :user_id, :password, :client_id)
+        requires!(options, :user_id, :password, :client_id, :client_key)
         super
       end
 
       def purchase(money, payment_method, options={})
         MultiResponse.run do |r|
           r.process { login }
-###          r.process { commit(purchase_request(money, payment_method, r.params['response_sessionid'], options), :response_transactionref) }
+          r.process { commit(purchase_request(money, payment_method, r.params['sessionid'], options)) }
         end
       end
 
       def refund(money, authorization, options={})
         MultiResponse.run do |r|
           r.process { login }
-          r.process { commit(refund_request(money, authorization, r.params['response_sessionid']), :response_creditrequestreceived) }
+          r.process { commit(refund_request(money, authorization, r.params['sessionid'])) } #, :response_creditrequestreceived
         end
       end
 
@@ -49,51 +49,31 @@ module ActiveMerchant
 
       private
 
+      def decrypt(value)
+        encrypted = Base64.urlsafe_decode64(value)
+        c = OpenSSL::Cipher.new('aes-256-ecb')
+        c.decrypt
+        c.key = @options[:client_key]
+        c.padding = 0
+        decrypted = c.update(encrypted) + c.final
+        inflated = Zlib::Inflate.new(-Zlib::MAX_WBITS).inflate(decrypted)
+      end
+
       def parse(body)
         results = body.split(/\r?\n/).inject({}) do |acc, pair|
           key, value = pair.split('=')
           acc[key] = CGI.unescape(value)
           acc
         end
-
         if !results.include?('errorlist') && results.include?('nvpvar')
-          nvpvar = Base64.urlsafe_decode64(results['nvpvar'])
-          cipher = OpenSSL::Cipher.new('aes-256-ecb')
-byebug
-          cipher.decrypt
-          cipher.key = @options[:merchant_key]
-          plain = cipher.update(nvpvar) + cipher.final
-          results['nvpvar'] = Zlib::Inflate.inflate(plain)
+          results['nvpvar'] = decrypt(results['nvpvar'])
+          results['nvpvar'].split('&').each do |pair|
+            key, value = pair.split('=')
+            results[key] = value
+          end
         end
-
         results
       end
-
-      # def parse(xml)
-      #   response = {}
-
-      #   doc = Nokogiri::XML(xml)
-      #   doc.root.xpath('*').each do |node|
-      #     if node.elements.empty?
-      #       response[node.name.downcase.to_sym] = node.text
-      #     else
-      #       node.elements.each do |childnode|
-      #         childnode_to_response(response, node, childnode)
-      #       end
-      #     end
-      #   end
-
-      #   response
-      # end
-
-      # def childnode_to_response(response, node, childnode)
-      #   name = "#{node.name.downcase}_#{childnode.name.downcase}"
-      #   if name == 'response_errors' && !childnode.elements.empty?
-      #     add_errors_to_response(response, childnode.to_s)
-      #   else
-      #     response[name.downcase.to_sym] = childnode.text
-      #   end
-      # end
 
       # def add_errors_to_response(response, errors_xml)
       #   errors_hash = Hash.from_xml(errors_xml).values.first
@@ -111,11 +91,8 @@ byebug
       #   end
       # end
 
-      def commit(request, success_field_name)
-        #response = parse(ssl_post(url, request, headers))
-        #response = parse(ssl_post(url(action), post_data(action, params), headers))
-        response = parse(ssl_post(url, post_data(request), headers))
-        #succeeded = success_from(response, success_field_name)
+      def commit(params)
+        response = parse(ssl_post(url, post_data(params), headers))
         succeeded = empty?(response['errorlist'])
         Response.new(
           succeeded,
@@ -126,20 +103,16 @@ byebug
         )
       end
 
-      def success_from(response, success_field_name)
-        !empty?(response[success_field_name])
-      end
-
       def message_from(succeeded, response)
         return 'Success' if succeeded
-        response[:error_message]
+        response['errorlist'] #TODO! map to values from numbers using vanco_common
       end
 
       def authorization_from(response)
         [
-          response[:response_customerref],
-          response[:response_paymentmethodref],
-          response[:response_transactionref]
+          response['customerref'],
+          response['paymentmethodref'],
+          response['transactionref']
         ].join('|')
       end
 
@@ -148,19 +121,17 @@ byebug
       end
 
       def purchase_request(money, payment_method, session_id, options)
-        build_xml_request do |doc|
-          add_auth(doc, 'EFTAddCompleteTransaction', session_id)
+        doc = {}
+        doc['nvpvar'] = {}
+        add_auth(doc, 'eftaddcompletetransaction', session_id)
+        add_client_id(doc)
+        add_amount(doc, money, options)
+##### need to resume here
+        add_payment_method(doc, payment_method, options)
+        add_options(doc, options)
+        add_purchase_noise(doc)
 
-          doc.Request do
-            doc.RequestVars do
-              add_client_id(doc)
-              add_amount(doc, money, options)
-              add_payment_method(doc, payment_method, options)
-              add_options(doc, options)
-              add_purchase_noise(doc)
-            end
-          end
-        end
+        doc
       end
 
       def refund_request(money, authorization, session_id)
@@ -198,23 +169,15 @@ byebug
 
       def add_amount(doc, money, options)
         if empty?(options[:fund_id])
-          doc.Amount(amount(money))
-        elsif options[:fund_id].respond_to?(:each_pair)
-          doc.Funds do
-            options[:fund_id].each_pair do |k,v|
-              doc.Fund do
-                doc.FundID(k)
-                doc.FundAmount(amount(v))
-              end
-            end
+          doc['amount'] = amount(money)
+        elsif options[:fund_id].respond_to?(:each_with_index)
+          options[:fund_id].each_with_index do |(k,v), i|
+            doc['nvpvar']["fundid_#{i}"] = k
+            doc['nvpvar']["fundamount_#{i}"] = amount(v)
           end
         else
-          doc.Funds do
-            doc.Fund do
-              doc.FundID(options[:fund_id])
-              doc.FundAmount(amount(money))
-            end
-          end
+          doc['nvpvar']["fundid_0"] = options[:fund_id]
+          doc['nvpvar']["fundamount_0"] = amount(money)
         end
       end
 
@@ -281,11 +244,11 @@ byebug
       end
 
       def add_client_id(doc)
-        doc.ClientID(@options[:client_id])
+        doc['nvpvar']['clientid'] = @options[:client_id]
       end
 
       def login
-        commit(login_request, :response_sessionid)
+        commit(login_request)
       end
 
       def login_request
@@ -309,7 +272,15 @@ byebug
         if doc.include?('nvpvar')
           nvpvar = doc['nvpvar'].map { |k, v| "#{k.to_s}=#{v.to_s}" }.join('&')
           if doc['requesttype'] && doc['requesttype'] != 'login'
-            # TODO! encrypt nvpvar
+            deflated = Zlib::Deflate.new(nil, -Zlib::MAX_WBITS).deflate(nvpvar, Zlib::FINISH)
+            padding_needed = 16 - (deflated.length % 16)
+            padded = deflated + (padding_needed == 16 ? '' : ' ' * padding_needed)
+            c = OpenSSL::Cipher.new('aes-256-ecb')
+            c.encrypt
+            c.key = @options[:client_key]
+            c.padding = 0
+            encrypted = c.update(padded) + c.final
+            nvpvar = Base64.urlsafe_encode64(encrypted)
           end
           params = doc.merge({ 'nvpvar' => nvpvar })
         else
