@@ -1,11 +1,13 @@
 require 'base64'
 require 'openssl'
 require 'zlib'
+require 'active_merchant/billing/gateways/vanco/vanco_common'
 
 module ActiveMerchant
   module Billing
     class VancoNvpGateway < Gateway
       include Empty
+      include VancoCommon
 
       self.test_url = 'https://uat.vancopayments.com/cgi-bin/wsnvp.vps'
       self.live_url = 'https://myvanco.vancopayments.com/cgi-bin/wsnvp.vps'
@@ -68,7 +70,7 @@ module ActiveMerchant
           results['nvpvar'] = decrypt(results['nvpvar'])
           results['nvpvar'].split('&').each do |pair|
             key, value = pair.split('=')
-            results[key] = value
+            results[key] = CGI.unescape(value)
           end
         end
         results
@@ -87,20 +89,23 @@ module ActiveMerchant
       end
 
       def success_from(request_type, response)
-        return response['creditrequestreceived'] == 'yes' if request_type == 'refund'
+        return (response['creditrequestreceived'] == 'yes') if request_type == 'refund'
         empty?(response['errorlist'])
       end
 
       def message_from(succeeded, response)
         return 'Success' if succeeded
-        response['errorlist'] #TODO! map to values from numbers using vanco_common
+        response['errorlist'].split(',').map do |no| 
+          ((no == '434' && response['ccauthdesc']) ? response['ccauthdesc'] : VANCO_ERROR_CODE[no])
+        end.join(', ') + '.'
       end
 
       def authorization_from(response)
         [
           response['customerref'],
           response['paymentmethodref'],
-          response['transactionref']
+          response['transactionref'],
+          response['ccauthcode']
         ].join('|')
       end
 
@@ -173,12 +178,15 @@ module ActiveMerchant
 
       def add_credit_card(doc, credit_card, options)
         doc['accountnumber'] = credit_card.number
+        doc['nvpvar']['customername'] = "#{credit_card.last_name}, #{credit_card.first_name}"
+        doc['name'] = "#{credit_card.last_name}, #{credit_card.first_name}"
         doc['name_on_card'] = credit_card.name
-        doc['expmonth'] = format(credit_card.month, :two_digits)
-        doc['expyear'] = format(credit_card.year, :two_digits)
+        doc['cardexpmonth'] = format(credit_card.month, :two_digits)
+        doc['cardexpyear'] = format(credit_card.year, :two_digits)
         doc['cvvcode'] = credit_card.verification_value
-        doc['name'] = credit_card.name
+        doc['cardbillingname'] = credit_card.name
         doc['accounttype'] = 'CC'
+        doc['nvpvar']['isdebitcardonly'] = 'No'
         add_billing_address(doc, options)
       end
 
@@ -186,12 +194,12 @@ module ActiveMerchant
         address = options[:billing_address]
         return unless address
 
-        doc['billingaddr1'] = address[:address1]
-        doc['billingaddr2'] = address[:address2]
-        doc['billingcity'] = address[:city]
-        doc['billingstate'] = address[:state]
-        doc['billingzip'] = address[:zip]
-        doc['billingcountrycode'] = address[:country]
+        doc['cardbillingaddr1'] = address[:address1]
+        doc['cardbillingaddr2'] = address[:address2] unless empty?(address[:address2])
+        doc['cardbillingcity'] = address[:city]
+        doc['cardbillingstate'] = address[:state]
+        doc['cardbillingzip'] = address[:zip]
+        doc['cardbillingcountrycode'] = address[:country] unless empty?(address[:country])
       end
 
       def add_echeck(doc, echeck)
@@ -202,7 +210,7 @@ module ActiveMerchant
         end
 
         doc['name'] = "#{echeck.last_name}, #{echeck.first_name}"
-        #doc['nvpvar']['customername'] = "#{echeck.last_name}, #{echeck.first_name}"
+        doc['nvpvar']['customername'] = "#{echeck.last_name}, #{echeck.first_name}"
         doc['accountnumber'] = echeck.account_number
         doc['routingnumber'] = echeck.routing_number
         doc['nvpvar']['transactiontypecode'] = 'WEB'
@@ -221,7 +229,7 @@ module ActiveMerchant
       end
 
       def add_options(doc, options)
-        #doc['customeripaddress'] = options[:ip] if options[:ip] # not in nvpws spec
+        doc['customeripaddress'] = options[:ip] if options[:ip]
         doc['newcustomer'] = options[:new_customer] if options[:new_customer]
         doc['nvpvar']['customerid'] = options[:customer_id] if options[:customer_id]
       end
@@ -254,7 +262,7 @@ module ActiveMerchant
       def post_data(doc)
         if doc.include?('nvpvar')
           nvpvar = doc['nvpvar'].map { |k, v| "#{k.to_s}=#{v.to_s}" }.join('&')
-          if doc['requesttype'] && doc['requesttype'] != 'login'
+          if doc['nvpvar']['requesttype'] && doc['nvpvar']['requesttype'] != 'login'
             deflated = Zlib::Deflate.new(nil, -Zlib::MAX_WBITS).deflate(nvpvar, Zlib::FINISH)
             padding_needed = 16 - (deflated.length % 16)
             padded = deflated + (padding_needed == 16 ? '' : ' ' * padding_needed)
